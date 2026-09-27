@@ -1,160 +1,82 @@
 # Known issues and risks
 
-Found during a code review in September 2026. Nothing here has been fixed in
-the script yet. The owner wants fixes pitched before they're implemented.
+The list started from a code review in September 2026. Items that have been
+fixed are kept at the bottom, with how they were fixed, so nobody reintroduces
+them. The owner wants fixes pitched before they're implemented.
 
 Status meanings:
-- **Confirmed** — reproduced with real rsync / bash in a Linux container.
-- **By inspection** — follows from the code; the effect depends on the
-  owner's setup, which hasn't been checked on the real machines.
-
-Severity is about the backup's integrity, not about how much code a fix takes.
+- **Confirmed**: reproduced with real rsync, bash and sshd in a Linux container.
+- **By inspection**: follows from the code; not reproduced.
 
 ---
 
-## High
+## Open
 
-### 1. Remote `sudo du` and `sudo xargs sha256sum` aren't covered by the documented sudoers line
-*By inspection. Depends on the remote user's real sudo rights.*
-
-The README tells you to add only `user ALL=(ALL) NOPASSWD: /usr/bin/rsync`.
-The script also runs:
-
-- `sudo du -sb …` in `remote_source_bytes` (free-space pre-flight)
-- `sudo xargs -0 sha256sum --` in `verify_ssh_leg` (verification)
-
-Over non-interactive SSH, both fail with "a terminal is required". The effects:
-
-- `remote_source_bytes`: stderr goes to `/dev/null` and `awk` prints `0`, so the
-  source size is 0 and **the free-space check always passes**.
-- `verify_ssh_leg`: logs "remote sha256sum failed; skipping verification of
-  this batch" and returns 1. The caller ignores that with `|| true`, so
-  `VERIFY_FAILED` stays 0 and **the run ends with `BACKUP COMPLETE` even though
-  nothing was verified**. The only visible sign is `Verification checked: 0`.
-
-If the remote user has full passwordless sudo, none of this happens, but
-issue #2 does.
-
-### 2. Free-space check ignores data already on the drive
-*By inspection.*
-
-`preflight` requires `free ≥ total_source × 1.1`. On every run after the first,
-most of the source is already on the drive, so the real requirement is the
-delta. Once the library is bigger than about 48% of the drive, the drive gets
-rejected on every run even though the backup would fit. With both drives the
-same size, the run then aborts with "No drive has enough free space". This is
-currently hidden if issue #1 makes the source size 0.
-
-### 3. `--delete` with no guard can wipe both drives in one run
-*By inspection.*
-
-If a source directory on the server is empty or unexpectedly missing, for
-example when `~/photos` is a mount that didn't come up after a reboot or
-someone moved it, then:
-
-- if the directory is empty, `rsync --delete` empties the matching folder on
-  Drive A, and the A→B mirror then empties it on Drive B **in the same run**;
-- if the path doesn't exist, rsync errors and the run aborts, which is safe.
-
-Nothing limits the damage: there's no `--max-delete` and no check for a
-missing or unmounted source. Deletions or ransomware-encrypted files on the
-server reach both drives the same way, because there's no versioning (see
-README Non-goals).
-
----
-
-## Medium
-
-### 4. Verification is all-or-nothing per batch
-*By inspection.*
-
-`verify_ssh_leg` hashes a batch with `xargs … sha256sum`. If **any** file fails
-to hash (it was deleted on the server after rsync copied it, or it has a bad
-path, see #5), `xargs` exits 123 and the whole batch is skipped with no
-per-file results. The lockstep comparison also assumes exactly one output line
-per input. If one line were missing, every later file would be reported as
-mismatched.
-
-### 5. Non-UTF-8 locale breaks verification for non-ASCII filenames
-*Confirmed.*
-
-rsync escapes filename bytes it can't print in the current locale:
-
-```
-$ LANG=C rsync -a --itemize-changes src/ dst/
->f+++++++++ \#303\#251\#345\#220\#215.txt      # real name: é名.txt
-```
-
-The script feeds these escaped names to `sha256sum`/`shasum` as paths. They
-don't exist, so the batch fails (#4). Terminal.app normally sets a UTF-8
-locale. `launchd`, `cron` and some SSH contexts often don't. That matters if
-the script is ever scheduled.
-
-### 6. The exit code doesn't reflect verification failures or skipped verification
-*By inspection.*
-
-`print_summary` prints `BACKUP FINISHED WITH VERIFICATION FAILURES`, but the
-exit code is still 0. Skipped verification (#1, #4) isn't reported as a
-problem at all. A wrapper that alerts on a non-zero exit won't catch either.
-
-### 7. rsync exit 24 ("some files vanished") aborts the run
-*By inspection.*
-
-If Immich deletes or moves a file while rsync is scanning, which is normal on
-a live server, rsync exits 24. `rsync_ssh_leg` treats any non-zero exit as
-fatal, so the remaining sources and the A→B mirror are skipped.
-
-### 8. A missing or stale DB dump is only a warning
-*By inspection.*
-
-If no `*.sql.gz` is found, the run continues and can finish with
-`BACKUP COMPLETE`. That happens when the backup job is disabled, when the
-unprivileged `ls` in `find_latest_dump` can't read the directory, or when the
-path is wrong. The dump's age isn't checked either, so a months-old dump is
-treated the same as last night's. Without the DB, the photos come back but
-albums, people, faces and metadata don't.
-
----
-
-## Low
-
-### 9. Byte totals use 1024-based units, but rsync `--human-readable` uses 1000
-*Confirmed.* rsync reported `6.00M` for 6,000,005 bytes, and
-`parse_bytes_transferred` turned that into 6,291,456 (+4.9%). The error is
-+7.4% at G and +10% at T. It only affects the summary.
-
-### 10. Log retention keeps about half as many run directories as intended
-*Confirmed.* In `prune_old_logs`, the glob `[0-9]*_*` matches both the `.log`
-files and the run directories, so `tail -n +31` counts them together. With 40
-runs present, it kept 30 logs and only 15 directories.
-
-### 11. File counters count both legs
-`FILES_NEW/UPDATED/DELETED` add the SSH leg and the mirror leg together. One
-new photo shows up as "Files new: 2". The dump counts as a file too.
-
-### 12. Case-insensitive APFS
+### Case-insensitive APFS (low, depends on drive format)
 Default APFS is case-insensitive. Linux paths that differ only by case
 (`IMG_1.JPG` and `img_1.jpg` in the same directory) collide on the drive. One
 overwrites the other, and every run re-transfers them. This is unlikely under
 Immich's own `upload/` and `library/`, but possible in `~/photos`. Formatting
-the drives as *APFS (Case-sensitive)* avoids it.
+the drives as *APFS (Case-sensitive)* avoids it; the README says how to check.
+The owner doesn't yet know how their drives are formatted.
 
-### 13. `drive_ready` doesn't check that the path is a mounted volume
+### `drive_ready` doesn't check that the path is a mounted volume (low)
 It only checks that the path is a directory and is writable. macOS
-permissions on `/Volumes` normally make this safe for a non-root user. Under
-`sudo`, a missing drive would mean writing to the boot disk. There's also no
-check that it's the *right* drive, such as a marker file.
+permissions on `/Volumes` normally make this safe for a non-root user. There's
+also no check that it's the *right* drive, such as a marker file.
+Planned in phase D.
 
-### 14. The Mac can sleep during a long first run
-Nothing prevents idle sleep (for example with `caffeinate`).
+### The Mac can sleep during a long first run (low)
+Nothing prevents idle sleep (for example with `caffeinate`). Planned in phase D.
 
-### 15. Other edge cases
+### The deletion limit is a brake, not a wall (by design)
+`--max-delete=N` lets rsync delete up to N files before it stops, so a wiped
+source can still lose up to N files per source from the **first** drive. The
+run then aborts before the mirror, so Drive B is untouched, and the next good
+run restores Drive A from the server. The empty-source and mount-point checks
+catch the common case (a mount that didn't come up) before any rsync runs.
+
+### The empty-source check can't see a "hollow" Immich folder
+Recent Immich versions keep a `.immich` marker file in `upload/`, `library/`
+and `profile/`, so those folders are never empty to the check. The check
+mainly protects `~/photos` and similar trees. `MAX_DELETE` is the protection
+for Immich's own folders.
+
+### Smaller items
 - GNU `sha256sum` prefixes the line with `\` for names containing a backslash
-  or newline, so those files would be reported as mismatched.
+  or newline. The comparison strips the prefix from the hash, but the escaped
+  name may not match, so such files end up as *unverified*, never as passed.
 - Two `SOURCES` entries with the same basename write to the same
   `rsync-<tag>.log`.
-- `main "$@"` ignores all arguments. There's no `--help` or `--dry-run`.
-- There's no lock against two runs at once.
+- There's no `--help` or `--dry-run`, and no lock against two runs at once.
+  Planned in phase D.
+- When an rsync call fails (for example on the deletion limit), its itemized
+  changes aren't added to the summary counters.
+- After a handled failure, the `ERR` trap still prints `Unhandled error in
+  main() … failing command: return 1`. That's noisy but harmless: the real
+  error is logged just above it.
+- Bash 3.2 couldn't be run in the test container (its source download is
+  blocked there). The code was written and reviewed against the 3.2 rules in
+  `AGENTS.md` and tested on Bash 5.2. The first real run on the Mac is the
+  3.2 test.
+
+---
+
+## Fixed (September 2026, phase A+B+C)
+
+| # | Was | Fix |
+|---|---|---|
+| 1 | Remote `sudo du` / `sudo xargs sha256sum` weren't covered by the documented sudoers line. The free-space check silently became a no-op and verification was silently skipped. | Pre-flight checks `sudo -n` for `/usr/bin/rsync`, `du` and `sha256sum` and dies with the exact sudoers line. Commands use `sudo -n` and absolute paths. xargs runs unprivileged and calls `sudo sha256sum`, so sudoers doesn't have to allow `xargs`. A failed `du` is fatal. Confirmed with an rsync-only sudoers file (dies) and the 3-command file (passes). |
+| 2 | The free-space check required the *whole* library plus 10% free on every run. | `drive_has_room` measures the existing backup on each drive (`du -sk`) and requires `(source − existing) × (1 + headroom)`. |
+| 3 | An empty source plus `--delete` could wipe both drives in one run. | `check_remote_sources` aborts if a source is missing or empty. Optional `REMOTE_MOUNTPOINTS` requires paths to be mounted. `MAX_DELETE` (default 1000) goes to rsync as `--max-delete`, and exit 25 is fatal before the mirror. Confirmed. |
+| 4 | Verification was all-or-nothing per batch and relied on lockstep line order. | `verify_leg` + `_compare_sums` key the results by relative path (awk arrays). Each file is OK, MISMATCH, NODST (fail), NOSRC or NONE (unverified). |
+| 5 | A non-UTF-8 locale made rsync escape non-ASCII names, which broke verification. | rsync runs with `-8`. Confirmed with `LANG=C`. |
+| 6 | Exit code 0 despite verification failures; skipped verification was invisible. | Exit 2 for failures, 3 for unverified files, with `unverified.txt` and a summary line. |
+| 7 | rsync exit 24 (vanished files) aborted the run. | `_rsync_rc` turns 24 into a warning and counts it. |
+| 8 | A missing dump only produced a warning, and dump age wasn't checked. | `check_dump` in pre-flight dies if there's no dump or if it's older than `DUMP_MAX_AGE_HOURS` (26). Age is computed on the remote. |
+| 9 | Byte totals were 1024-based while rsync `-h` is 1000-based. | Dropped `--human-readable`. The parser strips `,`/`.` separators and uses base-1000 units if a suffix ever appears. |
+| 10 | Log retention kept only about half the run directories. | Logs and run dirs are counted separately. Confirmed: 40 runs → 30 of each kept. |
+| 11 | File counters added the SSH leg and the mirror together. | Separate `FILES_*` (SSH) and `MIRROR_*` counters. |
 
 ---
 

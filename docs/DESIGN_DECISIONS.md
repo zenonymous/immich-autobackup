@@ -55,14 +55,42 @@ orphan window is "since the last nightly dump", not "since the start of this
 run". An asset that was *permanently* deleted after the dump (trash emptied)
 will be referenced by the DB but missing from the mirror.
 
+A missing dump, or one older than `DUMP_MAX_AGE_HOURS` (26h: one nightly
+cycle plus slack), stops the run in pre-flight. A backup without a current DB
+restores the photos but loses albums, people and metadata, so it shouldn't
+report success. `DUMP_MAX_AGE_HOURS=0` overrides this for a one-off run.
+
 ## `--rsync-path="sudo rsync"`
 
 Immich runs in Docker and writes files as root. Rather than chmod the library
 or run SSH as root, only the remote rsync process is elevated, via a
 `NOPASSWD: /usr/bin/rsync` sudoers entry. SSH stays unprivileged.
 Consequence: every *other* remote command that needs root also needs a sudoers
-entry. The script currently uses `sudo du` and `sudo xargs sha256sum`, which the
-documented sudoers line does not cover (see KNOWN_ISSUES #1).
+entry. The script uses exactly three: `/usr/bin/rsync`, `/usr/bin/du` (sizing)
+and `/usr/bin/sha256sum` (verification). They're always called by absolute
+path with `sudo -n`, so they match sudoers exactly and fail instead of
+prompting. `xargs` stays unprivileged and calls `sudo sha256sum` itself,
+because allowing `xargs` in sudoers would effectively allow any command.
+`check_ssh` tests all three up front. Full passwordless sudo also works.
+
+## Guarding `--delete`
+
+A mirror faithfully copies mistakes. The script adds three brakes, all of
+which fire before the mirror step so Drive B keeps the previous state:
+
+1. **Pre-flight source checks**: each source must exist and be non-empty, and
+   paths in `REMOTE_MOUNTPOINTS` must be mount points. This catches the most
+   likely disaster, a disk or share on the server that didn't mount, before
+   any rsync runs.
+2. **`--max-delete` (`MAX_DELETE`, default 1000 per rsync call)**: catches mass
+   deletion inside Immich's own folders. rsync stops deleting at the limit
+   and exits 25, which aborts the run.
+3. **Mirror only after a clean SSH leg**: any failure on the SSH leg aborts
+   before A → B runs.
+
+A dry-run pass to count deletions before touching anything was considered and
+rejected. It would double the remote file-list scan on every run, and checks
+1 and 3 already cover the destructive cases.
 
 ## Verify only what rsync moved
 
@@ -70,6 +98,12 @@ Hashing the whole library every run would take hours. rsync's own
 `--itemize-changes` output says which files it transferred, so only those are
 SHA-256'd on both ends. Unchanged files aren't re-checked. Permission-only
 changes (`>f.....p…`) aren't hashed because no bytes moved.
+
+Results are matched per file, by relative path, and there are three outcomes:
+passed, failed (mismatch, or the copy can't be read) and unverified (the
+source can't be hashed, typically because Immich removed it mid-run). They map
+to exit codes 0 / 2 / 3, so "nothing was verified" can never look like
+success.
 
 A→B verification is off by default: it's a local copy, and it's slow.
 
