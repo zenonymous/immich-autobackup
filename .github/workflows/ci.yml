@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n immich-backup.sh && bash -n tests/e2e.sh
+      - name: shellcheck (must be clean; intentional exceptions are annotated inline)
+        run: shellcheck -s bash immich-backup.sh tests/e2e.sh tests/unit.bats
+
+  unit-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update -q && sudo apt-get install -y -q bats
+      - name: Unit tests
+        run: bats tests/unit.bats
+
+  # The Mac is the real target: macOS /bin/bash is 3.2 and awk/xargs/touch/du
+  # are the BSD versions. Force bats (and the sourced script) onto /bin/bash.
+  unit-macos-bash32:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: brew install bats-core
+      - name: Put /bin/bash (3.2) first on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash32"
+          ln -s /bin/bash "$RUNNER_TEMP/bash32/bash"
+          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
+      - name: Check bash version
+        run: |
+          bash --version | head -n 1
+          bash --version | head -n 1 | grep -q 'version 3\.2'
+      - name: bash -n under 3.2
+        run: bash -n immich-backup.sh
+      - name: --help under 3.2
+        run: bash immich-backup.sh --help
+      - name: Unit tests under 3.2
+        run: bats tests/unit.bats
+
+  e2e-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rsync and sshd
+        run: sudo apt-get update -q && sudo apt-get install -y -q rsync openssh-server
+      - name: End-to-end tests
+        run: sudo bash tests/e2e.sh

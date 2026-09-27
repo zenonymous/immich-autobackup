@@ -53,54 +53,71 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# ============================================================================
-# CONFIG — edit these
-# ============================================================================
+# Values that can be overridden from the environment for one run. Captured
+# before the defaults below, so they win over both defaults and config file.
+ENV_VERIFY_LOCAL_MIRROR="${VERIFY_LOCAL_MIRROR-}"
+ENV_MAX_DELETE="${MAX_DELETE-}"
+ENV_DUMP_MAX_AGE_HOURS="${DUMP_MAX_AGE_HOURS-}"
 
-REMOTE_USER="user"                          # Edit: SSH username on the remote
-REMOTE_HOST="1.2.3.4"                       # Edit: hostname or IP of the remote
-SSH_KEY=""                                  # Optional override; empty => default
+# ============================================================================
+# CONFIG — defaults
+# ============================================================================
+#
+# Don't edit these here: put your settings in a config file instead, so
+# updating the script doesn't overwrite them. The file is plain bash,
+# sourced after these defaults; set only what you need. Location:
+#   ${XDG_CONFIG_HOME:-~/.config}/immich-backup/config
+# or pass --config FILE, or set IMMICH_BACKUP_CONFIG. A commented example
+# ships as immich-backup.conf.example.
 
-# Remote home directory. Almost always /home/${REMOTE_USER} on Ubuntu/Debian.
-# Override if the remote uses a non-standard home location.
-REMOTE_HOME="/home/${REMOTE_USER}"
+REMOTE_USER="user"                          # SSH username on the remote
+REMOTE_HOST="1.2.3.4"                       # Hostname or IP of the remote
+SSH_KEY=""                                  # Optional -i key; empty => default
+# Extra ssh options, e.g. (-p 2222 -o UserKnownHostsFile=/path). Used for
+# both ssh and rsync's -e, so no element may contain whitespace.
+SSH_EXTRA_OPTS=()
+
+# Remote home directory. Empty => /home/${REMOTE_USER}.
+REMOTE_HOME=""
 
 # Source paths to back up. Each entry is "REMOTE_PATH:DEST_SUBPATH".
 # Trailing slashes are intentional (rsync semantics: copy CONTENTS of dir).
-# Add "thumbs/" or "encoded-video/" here later if you ever change your mind.
-SOURCES=(
-  "${REMOTE_HOME}/immich-app/library/upload/:originals/upload/"
-  "${REMOTE_HOME}/immich-app/library/library/:originals/library/"
-  "${REMOTE_HOME}/immich-app/library/profile/:originals/profile/"
-  "${REMOTE_HOME}/photos/:external-library/photos/"
-)
+# Empty => upload/, library/, profile/ from ${REMOTE_HOME}/immich-app/library
+# and ${REMOTE_HOME}/photos (see finalize_config). Every source must exist
+# and be non-empty on the remote.
+SOURCES=()
 
 # Remote paths that must be mount points (e.g. a disk or NAS share holding
 # the external library). If one isn't mounted, the run aborts before any
 # transfer instead of letting `rsync --delete` mirror an empty directory.
-# Example: REMOTE_MOUNTPOINTS=("${REMOTE_HOME}/photos")
+# Example: REMOTE_MOUNTPOINTS=("/home/me/photos")
 REMOTE_MOUNTPOINTS=()
 
 # Postgres dump location. We only ever copy the newest *.sql.gz from here.
-DUMP_REMOTE_DIR="${REMOTE_HOME}/immich-app/library/backups"
+# Empty => ${REMOTE_HOME}/immich-app/library/backups.
+DUMP_REMOTE_DIR=""
 DUMP_DEST_SUBPATH="db"
 
 # Abort if the newest dump is older than this many hours (Immich writes one
-# nightly by default). 0 disables the check. Env override:
+# nightly by default). 0 disables the check. Env override for one run:
 #   DUMP_MAX_AGE_HOURS=0 ./immich-backup.sh
-DUMP_MAX_AGE_HOURS="${DUMP_MAX_AGE_HOURS:-26}"
+DUMP_MAX_AGE_HOURS=26
 
 # Maximum number of files a single rsync call may delete on the destination.
 # Protects against a source that was emptied by mistake. When the limit is hit
 # rsync stops deleting, the run aborts, and the A->B mirror is skipped so
-# Drive B keeps the previous state. "unlimited" disables the limit. Env override:
+# Drive B keeps the previous state. "unlimited" disables the limit. Env
+# override for one run:
 #   MAX_DELETE=unlimited ./immich-backup.sh
-MAX_DELETE="${MAX_DELETE:-1000}"
+MAX_DELETE=1000
 
 # DB defaults — unused by the default flow, kept here for future support of
 # a live `docker exec ... pg_dump` path if you ever want to add one.
+# shellcheck disable=SC2034
 DB_CONTAINER="immich_postgres"
+# shellcheck disable=SC2034
 DB_USER="postgres"
+# shellcheck disable=SC2034
 DB_NAME="immich"
 
 # Destinations (macOS APFS).
@@ -108,16 +125,21 @@ DRIVE_A="/Volumes/BackupA"
 DRIVE_B="/Volumes/BackupB"
 BACKUP_SUBDIR="immich-backup"
 
+# Refuse a drive path that isn't the mount point of its own volume (e.g. a
+# leftover empty folder in /Volumes after an unclean eject).
+REQUIRE_DRIVE_MOUNT=1
+
 # Logging.
 LOG_DIR="${HOME}/Library/Logs/immich-backup"
 LOG_RETENTION=30
 
-# Free-space headroom on each destination, as percent of the remote source
-# size. The drive has to have at least (source * (100+headroom)/100) free.
+# Free-space headroom, as percent of the data a drive still needs. The drive
+# must have at least (missing_bytes * (100+headroom)/100) free.
 HEADROOM_PCT=10
 
-# Verification toggles.
-VERIFY_LOCAL_MIRROR="${VERIFY_LOCAL_MIRROR:-0}"
+# Also SHA-256 verify the A->B mirror (slower). Env override for one run:
+#   VERIFY_LOCAL_MIRROR=1 ./immich-backup.sh
+VERIFY_LOCAL_MIRROR=0
 
 # ============================================================================
 # Internal state — don't edit
@@ -152,10 +174,17 @@ DRIVE_A_OK=0
 DRIVE_B_OK=0
 DUMP_PATH=""                                # Newest remote dump (preflight)
 
+# Set by parse_args() / main().
+DRY_RUN=0
+CONFIG_FILE=""
+LOCK_DIR=""
+LOCK_HELD=0
+
 # ============================================================================
 # Pretty printing — coloured stdout, plain log file
 # ============================================================================
 
+# shellcheck disable=SC2034  # C_GRN is part of the palette, unused for now
 if [[ -t 1 ]]; then
   C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'
   C_GRN=$'\033[32m'; C_BLU=$'\033[34m'; C_RST=$'\033[0m'
@@ -180,6 +209,187 @@ die()  { err "$@"; exit 1; }
 hr()   { log "────────────────────────────────────────────────────────────"; }
 
 # ============================================================================
+# Arguments and config file
+# ============================================================================
+
+usage() {
+  cat <<'USAGE'
+Usage: immich-backup.sh [--dry-run] [--config FILE] [--help]
+
+Back up an Immich server to two external drives (remote -> A, then A -> B).
+
+  -n, --dry-run    Run all pre-flight checks, then show what the SSH leg would
+                   copy and delete (rsync -n). Nothing is written to the
+                   drives; no verification, no mirror, no eject.
+  -c, --config F   Read settings from F instead of the default
+                   ${XDG_CONFIG_HOME:-~/.config}/immich-backup/config
+                   (also: IMMICH_BACKUP_CONFIG=F).
+  -h, --help       Show this help.
+
+One-run overrides via environment: VERIFY_LOCAL_MIRROR=1, MAX_DELETE=N|unlimited,
+DUMP_MAX_AGE_HOURS=N (0 = don't check).
+
+Exit codes: 0 ok, 1 failed, 2 verification failures, 3 some files unverified,
+64 bad command line.
+USAGE
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -c|--config)
+        if [[ $# -lt 2 ]]; then usage >&2; exit 64; fi
+        CONFIG_FILE="$2"; shift ;;
+      --config=*)   CONFIG_FILE="${1#--config=}" ;;
+      -h|--help)    usage; exit 0 ;;
+      *)            echo "Unknown argument: $1" >&2; usage >&2; exit 64 ;;
+    esac
+    shift
+  done
+  return 0
+}
+
+# Source the config file, if there is one. It's executed as bash, so refuse
+# one that other users could have written to.
+load_config() {
+  local f="$CONFIG_FILE" explicit=1
+  if [[ -z "$f" ]]; then
+    f="${IMMICH_BACKUP_CONFIG:-}"
+  fi
+  if [[ -z "$f" ]]; then
+    explicit=0
+    f="${XDG_CONFIG_HOME:-${HOME}/.config}/immich-backup/config"
+  fi
+  if [[ ! -f "$f" ]]; then
+    if [[ $explicit -eq 1 ]]; then
+      die "Config file not found: $f"
+    fi
+    CONFIG_FILE=""
+    return 0
+  fi
+  if [[ -n "$(find "$f" -maxdepth 0 \( -perm -020 -o -perm -002 \) 2>/dev/null)" ]]; then
+    die "Config file $f is writable by group/others; fix with: chmod go-w '$f'"
+  fi
+  # shellcheck source=/dev/null
+  source "$f"
+  CONFIG_FILE="$f"
+  return 0
+}
+
+# Fill in derived defaults, apply env overrides, validate. Runs after
+# load_config so derived paths follow a REMOTE_USER set in the config file.
+finalize_config() {
+  if [[ -z "$REMOTE_HOME" ]]; then REMOTE_HOME="/home/${REMOTE_USER}"; fi
+  if [[ -z "$DUMP_REMOTE_DIR" ]]; then
+    DUMP_REMOTE_DIR="${REMOTE_HOME}/immich-app/library/backups"
+  fi
+  if [[ ${#SOURCES[@]} -eq 0 ]]; then
+    SOURCES=(
+      "${REMOTE_HOME}/immich-app/library/upload/:originals/upload/"
+      "${REMOTE_HOME}/immich-app/library/library/:originals/library/"
+      "${REMOTE_HOME}/immich-app/library/profile/:originals/profile/"
+      "${REMOTE_HOME}/photos/:external-library/photos/"
+    )
+  fi
+  if [[ -n "$ENV_VERIFY_LOCAL_MIRROR" ]]; then VERIFY_LOCAL_MIRROR="$ENV_VERIFY_LOCAL_MIRROR"; fi
+  if [[ -n "$ENV_MAX_DELETE" ]]; then MAX_DELETE="$ENV_MAX_DELETE"; fi
+  if [[ -n "$ENV_DUMP_MAX_AGE_HOURS" ]]; then DUMP_MAX_AGE_HOURS="$ENV_DUMP_MAX_AGE_HOURS"; fi
+
+  if [[ "$REMOTE_HOST" == "1.2.3.4" ]]; then
+    die "REMOTE_HOST is still the placeholder 1.2.3.4. Set REMOTE_USER and REMOTE_HOST in your config file (see immich-backup.conf.example)."
+  fi
+  if [[ ! "$MAX_DELETE" =~ ^[0-9]+$ && "$MAX_DELETE" != "unlimited" ]]; then
+    die "MAX_DELETE must be a number or 'unlimited' (got '$MAX_DELETE')"
+  fi
+  if [[ ! "$DUMP_MAX_AGE_HOURS" =~ ^[0-9]+$ ]]; then
+    die "DUMP_MAX_AGE_HOURS must be a whole number (got '$DUMP_MAX_AGE_HOURS')"
+  fi
+  if [[ "$VERIFY_LOCAL_MIRROR" != "0" && "$VERIFY_LOCAL_MIRROR" != "1" ]]; then
+    die "VERIFY_LOCAL_MIRROR must be 0 or 1 (got '$VERIFY_LOCAL_MIRROR')"
+  fi
+  local s o
+  if [[ ${#SSH_EXTRA_OPTS[@]} -gt 0 ]]; then
+    for o in "${SSH_EXTRA_OPTS[@]}"; do
+      if [[ "$o" == *[[:space:]]* ]]; then
+        die "SSH_EXTRA_OPTS element '$o' contains whitespace; split it into separate elements."
+      fi
+    done
+  fi
+  if [[ "$SSH_KEY" == *[[:space:]]* ]]; then
+    die "SSH_KEY path '$SSH_KEY' contains whitespace, which rsync's -e can't pass through."
+  fi
+  for s in "${SOURCES[@]}"; do
+    if [[ "$s" != *:* || "${s%%:*}" != /*/ || "${s#*:}" != */ ]]; then
+      die "Bad SOURCES entry '$s': expected /absolute/remote/dir/:dest/subdir/ (both with trailing slash)"
+    fi
+  done
+
+  # Common flag set, plus --stats so we can parse byte totals.
+  # -8 prints non-ASCII filenames raw instead of \#ooo escapes, whatever the
+  # locale, so the verification step gets real paths. No --human-readable: it
+  # makes the --stats byte counts approximate (and locale-dependent).
+  RSYNC_BASE_FLAGS=(
+    -aH -8 --delete --partial --info=progress2
+    --itemize-changes --stats
+  )
+  if [[ "$MAX_DELETE" != "unlimited" ]]; then
+    RSYNC_BASE_FLAGS+=(--max-delete="$MAX_DELETE")
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    RSYNC_BASE_FLAGS+=(--dry-run)
+  fi
+  LOCK_DIR="${LOG_DIR}/.lock"
+  return 0
+}
+
+# ============================================================================
+# Single-run lock, sleep prevention
+# ============================================================================
+
+# mkdir is atomic, so it works as a lock on any filesystem. The owner's PID
+# goes inside so a lock left by a crashed run can be detected and cleared.
+acquire_lock() {
+  mkdir -p "$LOG_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local pid
+    pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+    if [[ -z "$pid" ]]; then
+      die "Lock ${LOCK_DIR} exists without a PID. If no other run is going, remove it: rm -r '${LOCK_DIR}'"
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      die "Another immich-backup run is in progress (pid $pid). Aborting."
+    fi
+    warn "Removing stale lock left by pid $pid (no longer running)."
+    rm -rf -- "$LOCK_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      die "Couldn't take the lock ${LOCK_DIR}; another run may have just started."
+    fi
+  fi
+  echo "$$" > "${LOCK_DIR}/pid"
+  LOCK_HELD=1
+  return 0
+}
+
+release_lock() {
+  if [[ $LOCK_HELD -eq 1 ]]; then
+    rm -rf -- "$LOCK_DIR"
+    LOCK_HELD=0
+  fi
+  return 0
+}
+
+# Keep the Mac awake (idle, disk and, on AC power, system sleep) until this
+# process exits. caffeinate -w watches our PID, so no cleanup is needed.
+keep_awake() {
+  if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -ims -w "$$" >/dev/null 2>&1 &
+    log "Sleep prevention on (caffeinate)."
+  fi
+  return 0
+}
+
+# ============================================================================
 # SSH plumbing
 # ============================================================================
 
@@ -191,15 +401,21 @@ init_ssh_opts() {
   if [[ -n "$SSH_KEY" ]]; then
     SSH_OPTS+=(-i "$SSH_KEY")
   fi
+  if [[ ${#SSH_EXTRA_OPTS[@]} -gt 0 ]]; then
+    SSH_OPTS+=("${SSH_EXTRA_OPTS[@]}")
+  fi
   return 0
 }
 
+# The command string is expanded locally on purpose: callers quote remote
+# paths with printf %q before passing them in.
 remote_ssh() {
+  # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
 }
 
 # rsync's -e takes a single string, so we flatten the SSH_OPTS array.
-# (None of our options contain whitespace, so this is safe.)
+# (finalize_config rejects options containing whitespace, so this is safe.)
 ssh_string_for_rsync() {
   local s="ssh" o
   for o in "${SSH_OPTS[@]}"; do s+=" $o"; done
@@ -370,9 +586,48 @@ check_dump() {
   DUMP_PATH="$path"
 }
 
+# Mount point of the filesystem holding $1 (df -P's last column; may
+# contain spaces, so join fields 6..NF).
+mount_point_of() {
+  df -P "$1" 2>/dev/null | awk 'NR==2 { mp=$6; for (i=7; i<=NF; i++) mp = mp " " $i; print mp }'
+}
+
+# drive_ready A|B PATH — is this drive usable as that role? Returns 1 (with a
+# warning) if it's absent, not a real mounted volume, or read-only. Dies if
+# the drive is tagged as the *other* role: that means the two drives are
+# mixed up, and syncing would go the wrong way.
+#
+# Each drive carries a marker file ".immich-backup-drive" containing "A" or
+# "B" at its root. An untagged drive gets tagged on first use (not in a dry
+# run). The marker lives outside BACKUP_SUBDIR, so the mirror doesn't copy it.
 drive_ready() {
-  local d="$1"
-  [[ -d "$d" && -w "$d" ]]
+  local role="$1" d="$2" marker tag
+  marker="${d}/.immich-backup-drive"
+  if [[ ! -d "$d" ]]; then
+    warn "Drive ${role} missing: $d"
+    return 1
+  fi
+  if [[ "$REQUIRE_DRIVE_MOUNT" == "1" && "$(mount_point_of "$d")" != "$d" ]]; then
+    warn "Drive ${role}: $d exists but isn't a mounted volume (leftover folder?). Skipping it."
+    return 1
+  fi
+  if [[ ! -w "$d" ]]; then
+    warn "Drive ${role} not writable: $d"
+    return 1
+  fi
+  if [[ -f "$marker" ]]; then
+    tag="$(head -n 1 "$marker" 2>/dev/null | tr -d '[:space:]')" || true
+    if [[ "$tag" != "$role" ]]; then
+      die "The drive at $d is tagged as drive '${tag}', but is mounted as drive ${role}. Are the drives swapped (rename them in Disk Utility), or is this the wrong disk?"
+    fi
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    log "Drive ${role} has no tag yet; a real run would tag it (${marker})."
+  else
+    printf '%s\n' "$role" > "$marker"
+    log "Tagged $d as drive ${role} (${marker})."
+  fi
+  log "Drive ${role} present: $d"
+  return 0
 }
 
 drive_free_bytes() {
@@ -437,14 +692,23 @@ print_summary() {
   log "  Verification not possible:     $VERIFY_UNVERIFIED"
   log "  rsync warnings (vanished):     $RSYNC_WARNINGS"
   log "  Total runtime:                 ${elapsed}s"
-  if [[ ${#USED_DRIVES[@]} -gt 0 ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "  Drives ejected:                none (dry run)"
+  elif [[ ${#USED_DRIVES[@]} -gt 0 ]]; then
+    local IFS=' '
     log "  Drives ejected:                ${USED_DRIVES[*]}"
   else
     log "  Drives ejected:                none"
   fi
   hr
   # rc here is the final exit code (see cleanup_eject).
-  if [[ $rc -eq 0 ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ $rc -eq 0 ]]; then
+      log "DRY RUN COMPLETE: nothing was changed. The SSH-leg numbers above are what a real run would do."
+    else
+      err "DRY RUN FAILED (exit $rc): a real run would stop here too."
+    fi
+  elif [[ $rc -eq 0 ]]; then
     log "BACKUP COMPLETE"
   elif [[ $rc -eq 2 ]]; then
     err "BACKUP FINISHED WITH VERIFICATION FAILURES (exit 2; see ${RUN_DIR}/verification-failures.txt)"
@@ -458,7 +722,8 @@ print_summary() {
 cleanup_eject() {
   local rc=$?
   trap - EXIT ERR
-  if [[ ${#USED_DRIVES[@]} -gt 0 ]]; then
+  # A dry run leaves the drives mounted: a real run usually follows.
+  if [[ $DRY_RUN -eq 0 && ${#USED_DRIVES[@]} -gt 0 ]]; then
     local drive
     for drive in "${USED_DRIVES[@]}"; do
       if [[ -d "$drive" ]]; then
@@ -477,6 +742,7 @@ cleanup_eject() {
     fi
   fi
   print_summary "$rc"
+  release_lock
   exit "$rc"
 }
 
@@ -509,17 +775,8 @@ mark_used() {
 # rsync wrappers
 # ============================================================================
 
-# Common flag set required by spec, plus --stats so we can parse byte totals.
-# -8 prints non-ASCII filenames raw instead of \#ooo escapes, whatever the
-# locale, so the verification step gets real paths. No --human-readable: it
-# makes the --stats byte counts approximate (and locale-dependent).
-RSYNC_BASE_FLAGS=(
-  -aH -8 --delete --partial --info=progress2
-  --itemize-changes --stats
-)
-if [[ "$MAX_DELETE" != "unlimited" ]]; then
-  RSYNC_BASE_FLAGS+=(--max-delete="$MAX_DELETE")
-fi
+# Set by finalize_config(): -aH -8 --delete ... (+ --max-delete, --dry-run).
+RSYNC_BASE_FLAGS=()
 
 RSYNC_LAST_LOG=""
 
@@ -560,7 +817,7 @@ rsync_ssh_leg() {
   local remote_path="$1" dest="$2" tag="$3" extra="${4:-}"
   local logfile="${RUN_DIR}/rsync-${tag}.log"
   RSYNC_LAST_LOG="$logfile"
-  mkdir -p "$dest"
+  if [[ $DRY_RUN -eq 0 ]]; then mkdir -p "$dest"; fi
 
   local flags=("${RSYNC_BASE_FLAGS[@]}")
   if [[ "$extra" == "no-delete" ]]; then
@@ -847,7 +1104,7 @@ fetch_latest_dump() {
   # check_dump (pre-flight) already guaranteed a recent enough dump exists.
   dump_name="$(basename "$latest")"
   dest_dir="${drive}/${BACKUP_SUBDIR}/${DUMP_DEST_SUBPATH}"
-  mkdir -p "$dest_dir"
+  if [[ $DRY_RUN -eq 0 ]]; then mkdir -p "$dest_dir"; fi
 
   # Single-file copy: no --delete (we'd risk wiping unrelated files), and we
   # do retention via prune_old_dumps below.
@@ -859,6 +1116,10 @@ fetch_latest_dump() {
   local bytes; bytes="$(parse_bytes_transferred "$RSYNC_LAST_LOG")"
   SSH_BYTES=$((SSH_BYTES + ${bytes:-0}))
   tally_itemize "$RSYNC_LAST_LOG" ssh
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    return 0
+  fi
 
   # Verify only when this is the SSH-leg drive (per spec).
   if [[ "$drive" == "$SSH_LEG_DRIVE" ]]; then
@@ -900,7 +1161,7 @@ sync_remote_to_drive() {
     SSH_BYTES=$((SSH_BYTES + ${bytes:-0}))
     tally_itemize "$RSYNC_LAST_LOG" ssh
 
-    if [[ "$drive" == "$SSH_LEG_DRIVE" ]]; then
+    if [[ $DRY_RUN -eq 0 && "$drive" == "$SSH_LEG_DRIVE" ]]; then
       verify_leg "SSH leg" remote "$remote_path" "$dest" "$RSYNC_LAST_LOG"
     fi
   done
@@ -947,8 +1208,13 @@ preflight() {
   setup_logging
   prune_old_logs
   log "==== immich-backup.sh starting at $(date) ===="
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "DRY RUN: nothing will be written to the drives."
+  fi
+  log "Config file: ${CONFIG_FILE:-none (script defaults)}"
   log "Run log: $LOG_FILE"
   log "Run dir: $RUN_DIR"
+  keep_awake
 
   init_ssh_opts
   detect_rsync
@@ -958,16 +1224,8 @@ preflight() {
   check_dump
 
   # Drive availability.
-  if drive_ready "$DRIVE_A"; then
-    DRIVE_A_OK=1; log "Drive A present: $DRIVE_A"
-  else
-    warn "Drive A missing or not writable: $DRIVE_A"
-  fi
-  if drive_ready "$DRIVE_B"; then
-    DRIVE_B_OK=1; log "Drive B present: $DRIVE_B"
-  else
-    warn "Drive B missing or not writable: $DRIVE_B"
-  fi
+  if drive_ready A "$DRIVE_A"; then DRIVE_A_OK=1; fi
+  if drive_ready B "$DRIVE_B"; then DRIVE_B_OK=1; fi
   if [[ $DRIVE_A_OK -eq 0 && $DRIVE_B_OK -eq 0 ]]; then
     die "Neither $DRIVE_A nor $DRIVE_B is mounted. Aborting."
   fi
@@ -1015,9 +1273,14 @@ preflight() {
 }
 
 main() {
+  parse_args "$@"
+  load_config
+  finalize_config
+
   trap 'on_err $LINENO' ERR
   trap cleanup_eject EXIT
 
+  acquire_lock
   preflight
 
   # ── Stage 1: SSH leg → primary drive ─────────────────────────────────────
@@ -1037,7 +1300,11 @@ main() {
   log "END    sync remote sources             (elapsed $(( $(date +%s) - stage_start ))s)"
 
   # ── Stage 2: local mirror, only when A was the primary AND B is available ─
-  if [[ "$SSH_LEG_DRIVE" == "$DRIVE_A" && $DRIVE_B_OK -eq 1 ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    # Drive A wasn't actually updated, so a dry A->B comparison would show
+    # stale differences. Skip it.
+    log "Dry run: skipping the A -> B mirror."
+  elif [[ "$SSH_LEG_DRIVE" == "$DRIVE_A" && $DRIVE_B_OK -eq 1 ]]; then
     mark_used "$DRIVE_B"
     stage_start=$(date +%s)
     log "BEGIN  mirror Drive A -> Drive B"
@@ -1053,4 +1320,7 @@ main() {
   fi
 }
 
-main "$@"
+# Run only when executed, not when sourced (the tests source this file).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
