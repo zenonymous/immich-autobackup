@@ -1,0 +1,49 @@
+# immich-backup config file (plain bash, sourced by immich-backup.sh).
+#
+# Copy to ~/.config/immich-backup/config and set what you need. Anything you
+# leave out keeps the default shown in the script's "CONFIG — defaults"
+# block. The file must not be writable by group/others:
+#
+#   mkdir -p ~/.config/immich-backup
+#   cp immich-backup.conf.example ~/.config/immich-backup/config
+#   chmod 600 ~/.config/immich-backup/config
+#
+# Another location: immich-backup.sh --config FILE (or IMMICH_BACKUP_CONFIG=FILE).
+
+# --- Required ---------------------------------------------------------------
+REMOTE_USER="user"            # SSH user on the Immich server
+REMOTE_HOST="192.168.1.10"    # Hostname or IP of the Immich server
+
+# --- Commonly changed -------------------------------------------------------
+# SSH_KEY="$HOME/.ssh/id_ed25519_immich"   # default: agent / ~/.ssh defaults
+# SSH_EXTRA_OPTS=(-p 2222)                  # extra ssh flags; no spaces inside elements
+
+# Remote paths that must be mount points. If ~/photos on the server is a
+# mounted disk or share, list it so an unmounted share aborts the run.
+# REMOTE_MOUNTPOINTS=("/home/user/photos")
+
+# Mount points of the two backup drives.
+# DRIVE_A="/Volumes/BackupA"
+# DRIVE_B="/Volumes/BackupB"
+
+# --- Less common ------------------------------------------------------------
+# REMOTE_HOME="/home/user"                  # default: /home/$REMOTE_USER
+# DUMP_REMOTE_DIR="/home/user/immich-app/library/backups"
+
+# What to copy: "REMOTE_DIR/:DEST_SUBDIR/" pairs, trailing slashes required.
+# Default (derived from REMOTE_HOME):
+# SOURCES=(
+#   "/home/user/immich-app/library/upload/:originals/upload/"
+#   "/home/user/immich-app/library/library/:originals/library/"
+#   "/home/user/immich-app/library/profile/:originals/profile/"
+#   "/home/user/photos/:external-library/photos/"
+# )
+
+# MAX_DELETE=1000             # per rsync call; "unlimited" to disable
+# DUMP_MAX_AGE_HOURS=26       # 0 disables the dump age check
+# VERIFY_LOCAL_MIRROR=0       # 1 = also SHA-256 verify the A->B mirror
+# HEADROOM_PCT=10
+# REQUIRE_DRIVE_MOUNT=1       # refuse a drive path that isn't a mounted volume
+# BACKUP_SUBDIR="immich-backup"
+# LOG_DIR="$HOME/Library/Logs/immich-backup"
+# LOG_RETENTION=30
