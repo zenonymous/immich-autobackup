@@ -25,7 +25,13 @@ Ubuntu host (Immich)  ──ssh + "sudo rsync"──▶  Drive A  ──local rs
 4. SHA-256 verify every file rsync reported as transferred on the SSH leg.
 5. Mirror Drive A → Drive B (verification optional, `VERIFY_LOCAL_MIRROR=1`).
 6. Eject both drives from an `EXIT` trap and print a summary.
-   Exit codes: 0 ok, 1 failed, 2 verification failures, 3 unverified files.
+   Exit codes: 0 ok, 1 failed, 2 verification failures, 3 unverified files,
+   64 bad command line.
+
+Around that: settings come from `~/.config/immich-backup/config` (sourced
+bash), a lock prevents parallel runs, `caffeinate` keeps the Mac awake, drives
+must be real mounts carrying an A/B tag file, and `--dry-run` runs the checks
+plus `rsync -n` without writing to the drives.
 
 The owner runs it by hand only (the drives live in a vault between runs), has
 full passwordless sudo on the server, and `~/photos` is a mounted disk/share.
@@ -37,13 +43,17 @@ See README "Non-goals" before proposing features in those areas.
 
 | Path | What |
 |---|---|
-| `immich-backup.sh` | The whole program (~890 lines). Config block at the top. |
+| `immich-backup.sh` | The whole program (~1300 lines). Defaults block at the top; sourceable (main runs only when executed). |
+| `immich-backup.conf.example` | User config template → `~/.config/immich-backup/config`. Keep in sync with the defaults block. |
+| `tests/unit.bats` | Unit tests (bats). Also run under macOS `/bin/bash` 3.2 in CI. |
+| `tests/e2e.sh` | End-to-end suite (Linux, root): throwaway sshd + tmpfs drives. |
+| `.github/workflows/ci.yml` | shellcheck, unit (Linux + macOS 3.2), e2e (Linux). |
 | `README.md` | User-facing docs: setup, config table, usage, troubleshooting. |
 | `AGENTS.md` / `CLAUDE.md` | This orientation. |
 | `docs/ARCHITECTURE.md` | Function-by-function walkthrough, control flow, state, output files. |
 | `docs/DESIGN_DECISIONS.md` | Why things are the way they are, incl. the non-obvious Bash 3.2 workarounds. |
 | `docs/KNOWN_ISSUES.md` | Verified bugs and risks, with evidence. **Check before "fixing" something.** |
-| `docs/TESTING.md` | How to test this on Linux / without the real hardware. |
+| `docs/TESTING.md` | Test suites, what they cover, what nothing covers. |
 
 ## Hard constraints (don't break these)
 
@@ -77,15 +87,19 @@ See README "Non-goals" before proposing features in those areas.
 
 ## How to work here
 
-- Lint: `shellcheck -s bash immich-backup.sh`. Current baseline: SC2034 ×4
-  (unused `DB_*`/`C_GRN` vars) and SC2029 ×1 (intentional client-side
-  expansion in `remote_ssh`). Don't add new ones.
-- Syntax check: `bash -n immich-backup.sh`.
-- There is **no test suite and no CI** yet (planned: phase E). `docs/TESTING.md`
-  describes a harness that runs the *whole* script end-to-end on Linux against
-  a local sshd with a fake Immich tree, fake drives and a stubbed `diskutil`.
-- That harness runs Bash 5, not 3.2. Say which parts were tested where; don't
-  claim macOS verification you didn't do.
+- Before pushing, run: `shellcheck -s bash immich-backup.sh tests/e2e.sh tests/unit.bats`
+  (must be **clean**; intentional exceptions are inline `disable` comments with
+  a reason), `bats tests/unit.bats`, and, if you're root on Linux,
+  `tests/e2e.sh`. Details are in `docs/TESTING.md`.
+- New logic gets a unit test. New safety behaviour gets an e2e scenario, and
+  it's worth checking that the scenario fails against a copy with the
+  behaviour removed (`IMMICH_BACKUP_SCRIPT=…`).
+- CI's macOS job is the only automated Bash 3.2 / BSD-tools check. Linux
+  results say nothing about 3.2. Say which parts were tested where.
+- New settings: add them to the defaults block, `finalize_config`
+  (validation or derivation), `immich-backup.conf.example`, and the README
+  config table.
+- Anything that writes to a drive must respect `DRY_RUN`.
 - The owner wants improvements **pitched before implemented**. Don't refactor
   or change behaviour unprompted.
 - Keep README's config table and "What it does" list in sync with the script.
@@ -102,9 +116,8 @@ See README "Non-goals" before proposing features in those areas.
 
 - ✅ A+B+C (Sept 2026): delete guards, dump checks, trustworthy verification,
   exit codes, free-space/byte/log fixes. See KNOWN_ISSUES "Fixed".
-- ⏭ D: `caffeinate`, `--dry-run`, lock file, verify drives are real mounts
-  with a marker file.
-- ⏭ E: config file outside the script, bats tests for the parsers, CI
-  (shellcheck + tests).
+- ✅ D (Sept 2026): `caffeinate`, `--dry-run`, lock, drives must be real
+  mounts with an A/B tag.
+- ✅ E (Sept 2026): config file, `tests/unit.bats`, `tests/e2e.sh`, CI.
 - Maybe later (F): keep deleted files for N days on the drives, keep several
   dumps, restore runbook.

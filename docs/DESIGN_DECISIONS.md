@@ -7,8 +7,10 @@ this file.
 ## Scope
 
 **Manual, attended, single-file.** The owner plugs in two drives, runs the
-script, and unplugs them. No daemon, no scheduler, no config file, no restore
-path. The README's *Non-goals* are deliberate, not missing features.
+script, and unplugs them. The drives live in a vault between runs. No daemon,
+no scheduler, no restore path. The README's *Non-goals* are deliberate, not
+missing features. The program is still one file. Settings moved to an
+optional config file (below), and tests live next to it.
 
 **Pull from the Mac, not push from the server.** The server needs no software
 beyond `rsync` and one sudoers line. The Mac holds the SSH key; the server has
@@ -119,6 +121,59 @@ without Homebrew bash. Workarounds you'll see in the code:
 | Capturing `rsync --version` into a variable, then regex-parsing | `rsync --version \| head -1` gets SIGPIPE (141) under `pipefail`. |
 | `BASH_LINENO[0]` + `BASH_COMMAND` in `on_err` | `$LINENO` in ERR traps is unreliable in 3.2. |
 | NUL-separated lists + `read -d ''` loops | No `mapfile -d`. Filenames can contain spaces. |
+
+## Config file, not script edits
+
+Settings used to be edited in the script itself, which meant every update of
+the script overwrote them. Now the script only holds defaults, and the config
+file is **sourced bash**. That's the simplest format that supports arrays
+(`SOURCES`, `REMOTE_MOUNTPOINTS`, `SSH_EXTRA_OPTS`) without a parser, and it's
+what the old in-script block already was. Because it's executed, a config
+file that's writable by group or others is refused.
+
+Precedence: environment (only the three documented one-run overrides), then
+the config file, then the defaults. Values derived from others (`REMOTE_HOME`
+from `REMOTE_USER`, the default `SOURCES` from `REMOTE_HOME`) are computed in
+`finalize_config`, *after* loading, so setting `REMOTE_USER` alone is enough.
+`finalize_config` also validates, so a typo fails before anything connects.
+
+## Lock, sleep, drive identity
+
+- **Lock**: `mkdir` is atomic everywhere, needs no `flock` (not on macOS), and
+  holds the PID so a crash's leftover lock is detected and cleared. It lives in
+  `LOG_DIR`, which is per user.
+- **Sleep**: `caffeinate -ims -w $$` runs alongside the script and exits with
+  it. There's nothing to clean up, and it's skipped where caffeinate doesn't
+  exist (Linux tests).
+- **Drive identity**: a drive must be the mount point of its own filesystem.
+  An empty `/Volumes/BackupA` folder left after an unclean eject would
+  otherwise look like a drive. Each drive carries a one-line tag file (`A`/`B`)
+  outside `BACKUP_SUBDIR`, so the mirror never copies it. The tag catches
+  swapped drives. It deliberately doesn't pin a specific disk (UUIDs would make
+  replacing a drive a chore). Untagged drives are tagged on first use, so
+  existing drives and new drives need no setup step.
+
+## Dry run
+
+`--dry-run` answers "is everything ready, and what would change?". It runs
+all pre-flight checks for real, then the SSH leg with `rsync -n`. It stops
+there: a dry A→B comparison would compare against a Drive A that wasn't
+actually updated, and would mislead. The drives aren't ejected, because a real
+run usually follows.
+
+## Tests and CI
+
+Two layers:
+- **`tests/unit.bats`**: pure functions and config logic, with no network or
+  root. CI runs it on Linux *and* on macOS forced onto `/bin/bash` 3.2 with
+  the BSD tools. That's the only automated check of the real target
+  environment.
+- **`tests/e2e.sh`**: the real script against a throwaway sshd, a root-owned
+  fake Immich tree, tmpfs "drives" and a stub `diskutil`, as root on Linux. It
+  covers the safety behaviour (deletion limit, empty source, sudo, exit codes).
+
+shellcheck must be clean. Intentional exceptions are annotated inline with a
+reason, so CI can fail on any new finding.
 
 ## Output
 

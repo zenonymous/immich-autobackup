@@ -1,7 +1,9 @@
 # Architecture
 
-Everything lives in `immich-backup.sh`. This doc maps it section by section so
-you can find things without reading all ~890 lines. Function names are stable
+Everything lives in `immich-backup.sh` (~1300 lines). Settings come from an
+optional config file (`immich-backup.conf.example` shows the format). Tests
+are in `tests/`, CI in `.github/workflows/ci.yml`. This doc maps the script
+section by section, so you can find things without reading all of it. Function names are stable
 anchors; line numbers are not, so none are given.
 
 ## Topology
@@ -25,30 +27,35 @@ The Mac always *pulls*. Nothing is installed on the server except a sudoers entr
 |---|---|
 | Header comment | Purpose, rationale for dump-first and `sudo rsync`, prerequisites, usage, exit codes. |
 | `set -Eeuo pipefail`, `IFS=$'\n\t'` | Strict mode. `-E` makes the `ERR` trap fire inside functions. |
-| **CONFIG** | `REMOTE_*`, `SSH_KEY`, `SOURCES`, `REMOTE_MOUNTPOINTS`, `DUMP_REMOTE_DIR`, `DUMP_MAX_AGE_HOURS`, `MAX_DELETE`, `DRIVE_A/B`, `BACKUP_SUBDIR`, `LOG_*`, `HEADROOM_PCT`, `VERIFY_LOCAL_MIRROR`. `DB_CONTAINER/DB_USER/DB_NAME` are unused placeholders. `VERIFY_LOCAL_MIRROR`, `DUMP_MAX_AGE_HOURS` and `MAX_DELETE` can be overridden from the environment. |
-| Internal state | Globals: counters, `SSH_OPTS`, `USED_DRIVES`, `SSH_LEG_DRIVE`, `DRIVE_A_OK/B_OK`, `DUMP_PATH`, `LOG_FILE`, `RUN_DIR`, `RSYNC`. |
+| `ENV_*` capture | `VERIFY_LOCAL_MIRROR`, `MAX_DELETE`, `DUMP_MAX_AGE_HOURS` from the environment, saved before the defaults overwrite them. |
+| **CONFIG — defaults** | `REMOTE_*`, `SSH_KEY`, `SSH_EXTRA_OPTS`, `SOURCES`, `REMOTE_MOUNTPOINTS`, `DUMP_REMOTE_DIR`, `DUMP_MAX_AGE_HOURS`, `MAX_DELETE`, `DRIVE_A/B`, `BACKUP_SUBDIR`, `REQUIRE_DRIVE_MOUNT`, `LOG_*`, `HEADROOM_PCT`, `VERIFY_LOCAL_MIRROR`. Derived values (`REMOTE_HOME`, `SOURCES`, `DUMP_REMOTE_DIR`) default to empty and are filled in by `finalize_config`. `DB_CONTAINER/DB_USER/DB_NAME` are unused placeholders. |
+| Internal state | Globals: counters, `SSH_OPTS`, `USED_DRIVES`, `SSH_LEG_DRIVE`, `DRIVE_A_OK/B_OK`, `DUMP_PATH`, `DRY_RUN`, `CONFIG_FILE`, `LOCK_DIR/LOCK_HELD`, `LOG_FILE`, `RUN_DIR`, `RSYNC`. |
 | Pretty printing | `_emit`, `log`, `warn`, `err`, `die`, `hr`. Coloured to stdout if a TTY, plain line appended to `$LOG_FILE`. |
+| Arguments and config | `usage`, `parse_args`, `load_config` (find, permission-check and source the file), `finalize_config` (derive, apply env overrides, validate, build `RSYNC_BASE_FLAGS`, set `LOCK_DIR`). |
+| Lock, sleep | `acquire_lock`, `release_lock`, `keep_awake`. |
 | SSH plumbing | `init_ssh_opts` (BatchMode, 10s timeout, optional `-i`), `remote_ssh`, `ssh_string_for_rsync` (flattens opts for rsync `-e`). |
 | Tooling | `detect_rsync` (Homebrew paths first, requires major ≥ 3), `human_bytes`. |
 | Logging | `setup_logging`, `prune_old_logs`. |
-| Pre-flight helpers | `check_local_tools`, `check_ssh` (sudo for rsync/du/sha256sum), `check_remote_sources` (exists, non-empty, mounted), `find_latest_dump` + `check_dump` (exists, age), `drive_ready`, `drive_free_bytes`, `remote_source_bytes`, `local_backup_bytes`, `drive_needed_bytes`. |
+| Pre-flight helpers | `check_local_tools`, `check_ssh` (sudo for rsync/du/sha256sum), `check_remote_sources` (exists, non-empty, mounted), `find_latest_dump` + `check_dump` (exists, age), `mount_point_of`, `drive_ready` (exists, real mount, writable, A/B tag), `drive_free_bytes`, `remote_source_bytes`, `local_backup_bytes`, `drive_needed_bytes`. |
 | Traps | `print_summary`, `cleanup_eject` (EXIT; also maps verification results to exit 2/3), `on_err` (ERR), `mark_used`. |
 | rsync wrappers | `RSYNC_BASE_FLAGS` (+ `--max-delete`), `_rsync_rc` (exit 24 → warning, 25 → explained failure), `_normalise_log`, `rsync_ssh_leg`, `rsync_local_leg`, `parse_bytes_transferred`, `tally_itemize`. |
 | Verification | `extract_transferred_relpaths`, `_hash_list`, `_compare_sums`, `verify_leg`. |
 | Stages | `fetch_latest_dump`, `prune_old_dumps`, `sync_remote_to_drive`, `mirror_a_to_b`. |
-| Main | `drive_has_room`, `preflight`, `main`, then `main "$@"` (arguments are ignored). |
+| Main | `drive_has_room`, `preflight`, `main`. The last lines call `main "$@"` only when the file is executed, not when it's sourced (the unit tests source it). |
 
 ## Control flow
 
 ```
 main
+├─ parse_args → load_config → finalize_config   (errors here: exit 1/64, no summary)
 ├─ trap on_err ERR ; trap cleanup_eject EXIT
+├─ acquire_lock                     (another live run → die)
 ├─ preflight
-│   ├─ setup_logging → prune_old_logs
+│   ├─ setup_logging → prune_old_logs → keep_awake (caffeinate)
 │   ├─ init_ssh_opts → detect_rsync → check_local_tools → check_ssh
 │   ├─ check_remote_sources         (mounted? exists? non-empty? else die)
 │   ├─ check_dump                   (newest dump exists and is young enough, else die)
-│   ├─ drive_ready A / B            (both missing → die)
+│   ├─ drive_ready A / B            (missing/not a mount → skip; wrong tag → die; both unusable → die)
 │   ├─ remote_source_bytes          (sudo du -sb on remote; failure → die)
 │   ├─ drive_has_room A / B         ((source − existing)*(1+HEADROOM) ≤ free, else skip drive)
 │   └─ SSH_LEG_DRIVE = A if OK else B
@@ -56,11 +63,19 @@ main
 ├─ fetch_latest_dump   → rsync_ssh_leg (no-delete) → verify_leg remote → prune_old_dumps
 ├─ sync_remote_to_drive  (for each SOURCES entry)
 │      rsync_ssh_leg → parse_bytes_transferred → tally_itemize ssh → verify_leg remote
-├─ if SSH_LEG_DRIVE==A and B OK: mark_used B → mirror_a_to_b
+├─ if DRY_RUN: skip mirror
+│  elif SSH_LEG_DRIVE==A and B OK: mark_used B → mirror_a_to_b
 │      rsync_local_leg → parse/tally mirror → [verify_leg local if VERIFY_LOCAL_MIRROR=1]
-└─ (EXIT) cleanup_eject: diskutil eject each USED_DRIVES → rc 0→2/3 if verification
-          failed/incomplete → print_summary → exit rc
+└─ (EXIT) cleanup_eject: diskutil eject each USED_DRIVES (not in dry run) → rc 0→2/3
+          if verification failed/incomplete → print_summary → release_lock → exit rc
 ```
+
+### Dry run
+
+`finalize_config` adds `--dry-run` to `RSYNC_BASE_FLAGS`. The rest is guarded
+with `DRY_RUN`: no `mkdir` of destinations, no drive tagging, no verification,
+no dump pruning, no mirror, no eject. Pre-flight runs in full, and the summary
+counters then show what a real run would do.
 
 ### Error handling model
 

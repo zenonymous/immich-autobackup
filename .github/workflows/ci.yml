@@ -11,7 +11,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: bash -n
         run: bash -n immich-backup.sh && bash -n tests/e2e.sh
       - name: shellcheck (must be clean; intentional exceptions are annotated inline)
@@ -20,7 +20,7 @@ jobs:
   unit-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install bats
         run: sudo apt-get update -q && sudo apt-get install -y -q bats
       - name: Unit tests
@@ -31,7 +31,7 @@ jobs:
   unit-macos-bash32:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install bats
         run: brew install bats-core
       - name: Put /bin/bash (3.2) first on PATH
@@ -53,7 +53,7 @@ jobs:
   e2e-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install rsync and sshd
         run: sudo apt-get update -q && sudo apt-get install -y -q rsync openssh-server
       - name: End-to-end tests

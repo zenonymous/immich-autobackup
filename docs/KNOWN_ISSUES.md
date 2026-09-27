@@ -20,14 +20,14 @@ Immich's own `upload/` and `library/`, but possible in `~/photos`. Formatting
 the drives as *APFS (Case-sensitive)* avoids it; the README says how to check.
 The owner doesn't yet know how their drives are formatted.
 
-### `drive_ready` doesn't check that the path is a mounted volume (low)
-It only checks that the path is a directory and is writable. macOS
-permissions on `/Volumes` normally make this safe for a non-root user. There's
-also no check that it's the *right* drive, such as a marker file.
-Planned in phase D.
+### Drive tags identify a role, not a specific disk
+The `.immich-backup-drive` marker says "A" or "B", so it catches swapped
+drives. A *new* disk that gets named `BackupA` is simply tagged A on first use
+and accepted. That's intended: replacing a drive should just work.
 
-### The Mac can sleep during a long first run (low)
-Nothing prevents idle sleep (for example with `caffeinate`). Planned in phase D.
+### Laptop lid closed = sleep anyway
+`caffeinate -ims` prevents idle and disk sleep, and system sleep on AC power.
+Closing a MacBook's lid without an external display still sleeps it.
 
 ### The deletion limit is a brake, not a wall (by design)
 `--max-delete=N` lets rsync delete up to N files before it stops, so a wiped
@@ -48,17 +48,18 @@ for Immich's own folders.
   name may not match, so such files end up as *unverified*, never as passed.
 - Two `SOURCES` entries with the same basename write to the same
   `rsync-<tag>.log`.
-- There's no `--help` or `--dry-run`, and no lock against two runs at once.
-  Planned in phase D.
 - When an rsync call fails (for example on the deletion limit), its itemized
   changes aren't added to the summary counters.
 - After a handled failure, the `ERR` trap still prints `Unhandled error in
   main() … failing command: return 1`. That's noisy but harmless: the real
   error is logged just above it.
-- Bash 3.2 couldn't be run in the test container (its source download is
-  blocked there). The code was written and reviewed against the 3.2 rules in
-  `AGENTS.md` and tested on Bash 5.2. The first real run on the Mac is the
-  3.2 test.
+- The end-to-end suite runs on Linux (Bash 5, GNU tools). macOS is covered
+  by the unit tests in CI under `/bin/bash` 3.2 with the BSD tools, but the
+  full flow (real `diskutil`, `caffeinate`, `/Volumes`) is only exercised by
+  real runs on the Mac.
+- `--dry-run` on a drive that has never been backed up can't simulate the
+  mirror step, and reports rsync's view of a destination that doesn't exist
+  yet (everything new).
 
 ---
 
@@ -77,6 +78,16 @@ for Immich's own folders.
 | 9 | Byte totals were 1024-based while rsync `-h` is 1000-based. | Dropped `--human-readable`. The parser strips `,`/`.` separators and uses base-1000 units if a suffix ever appears. |
 | 10 | Log retention kept only about half the run directories. | Logs and run dirs are counted separately. Confirmed: 40 runs → 30 of each kept. |
 | 11 | File counters added the SSH leg and the mirror together. | Separate `FILES_*` (SSH) and `MIRROR_*` counters. |
+
+## Fixed (September 2026, phase D+E)
+
+| Was | Fix |
+|---|---|
+| `drive_ready` accepted any writable folder, even an empty leftover in `/Volumes`. | Must be the mount point of its own filesystem (`REQUIRE_DRIVE_MOUNT=1`), and carry the right A/B tag. |
+| The Mac could sleep during a long run. | `caffeinate -ims -w $$` for the life of the process. |
+| No `--help`/`--dry-run`, no lock. | `parse_args`, `--dry-run`, and a `mkdir` lock with PID and stale-lock recovery. |
+| Settings lived in the script, so updating the script lost them. | Config file (`load_config`/`finalize_config`), with an example file. |
+| No tests or CI. | `tests/unit.bats`, `tests/e2e.sh`, and `.github/workflows/ci.yml`. |
 
 ---
 
