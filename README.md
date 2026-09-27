@@ -9,9 +9,9 @@ It's deliberately small, deliberately not a daemon, and deliberately tied to one
 On each run, in order:
 
 1. **Pre-flight checks** — Homebrew rsync ≥ 3, SSH reachable, passwordless `sudo rsync` works on the remote, at least one destination drive is mounted and writable, free space ≥ source size + 10% headroom.
-2. **Database dump first** — copies the newest `*.sql.gz` from `~/immich-app/library/backups/` on the remote. Old dumps on the destination are pruned so only the latest remains. Dump-before-assets is intentional: a DB referencing assets that haven't arrived yet is recoverable; the inverse leaves orphans.
+2. **Database dump first** — copies the newest `*.sql.gz` from `~/immich-app/library/backups/` on the remote. Old dumps on the destination are pruned so only the latest remains. Dump-before-assets is intentional: it guarantees the backed-up assets are at least as new as the DB, so a restore can at worst leave harmless untracked files, rather than DB rows pointing at files that aren't in the backup. The script copies Immich's own scheduled dump; it does not create a fresh one.
 3. **Asset sync** — `rsync -aH --delete` over SSH for `upload/`, `library/`, `profile/`, and `~/photos/`. `thumbs/`, `encoded-video/`, and `postgres/` are excluded — they're regenerable or already captured by the dump.
-4. **Verification** — for every file rsync reports as newly transferred or content/size/time-changed, computes SHA-256 on both ends and compares. Mismatches go to `verification-failures.txt` next to the run log.
+4. **Verification** — for every file rsync reports as newly transferred or content/size/time-changed, computes SHA-256 on both ends and compares. Mismatches go to `verification-failures.txt` in the run's log directory.
 5. **Local mirror** — `rsync -aH --delete` from Drive A → Drive B. Checksum verification is off by default here (the local copy is fast and the next remote sync would catch corruption); set `VERIFY_LOCAL_MIRROR=1` to turn it on.
 6. **Eject** — both drives are ejected via an `EXIT` trap, so they come out cleanly even if the script aborts.
 
@@ -175,7 +175,7 @@ On the SSH leg, the script parses rsync's `--itemize-changes` output for `>f` li
 2. Hashes the file locally: `xargs -0 shasum -a 256`.
 3. Compares.
 
-Per-file results go to the log file (not stdout — they'd drown out everything else). Mismatches go to both stdout and a sibling `verification-failures.txt`. The summary at the end of the run reports `checked / passed / failed`.
+Per-file results go to the log file (not stdout — they'd drown out everything else). Mismatches go to both stdout and `<run-dir>/verification-failures.txt`. The summary at the end of the run reports `checked / passed / failed`.
 
 Files rsync didn't touch are not re-hashed. That's the whole point of using rsync's own report — verifying things rsync skipped would defeat the speed.
 
@@ -183,8 +183,12 @@ Files rsync didn't touch are not re-hashed. That's the whole point of using rsyn
 
 ```
 ~/Library/Logs/immich-backup/
-├── 2026-04-26_173312.log
-├── 2026-04-26_173312.verification-failures.txt   # only if any failed
+├── 2026-04-26_173312.log                 # main run log
+├── 2026-04-26_173312/                    # per-run dir
+│   ├── rsync-dump-BackupA.log
+│   ├── rsync-BackupA-upload.log …        # one rsync transcript per source
+│   ├── rsync-mirror-a-to-b.log
+│   └── verification-failures.txt         # only if any failed
 ├── 2026-04-25_173015.log
 ├── ...
 └── latest.log → 2026-04-26_173312.log
@@ -240,6 +244,14 @@ This script does *not*:
 - Notify on failure. It exits non-zero; wrap it in something else if you want notifications (`launchd`, a one-line `||` to `osascript`, etc.).
 - Schedule itself. Run it manually, or wrap it in `launchd` / `cron`.
 - Do incremental snapshots, versioning, or point-in-time recovery. The destination is a *mirror*; deleted files on the source are deleted on the destination on the next run. If you want versioned history, use Time Machine alongside this, or layer something like `restic` on top.
+
+## For contributors (and AI agents)
+
+- [`AGENTS.md`](AGENTS.md): orientation, hard constraints (Bash 3.2, BSD tools, sudoers), how to work here
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): function map, control flow, output files
+- [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md): why it's built this way
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md): verified bugs and risks. **Read before relying on verification or the free-space check.**
+- [`docs/TESTING.md`](docs/TESTING.md): how to test without a Mac
 
 ## License
 
